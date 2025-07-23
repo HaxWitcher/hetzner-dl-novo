@@ -1,7 +1,5 @@
-// server.js
 const express = require('express');
 const https   = require('https');
-const { spawn } = require('child_process');
 const fs      = require('fs');
 const path    = require('path');
 
@@ -9,27 +7,39 @@ const app       = express();
 const PORT      = process.env.PORT || 7860;
 const KEY       = process.env.RAPIDAPI_KEY;
 const HOST      = 'cloud-api-hub-youtube-downloader.p.rapidapi.com';
+const CACHE_DIR = '/tmp/cache';
+const TTL_MS    = 3 * 60 * 60 * 1000; // 3h
 
 if (!KEY) {
-  console.error('❌ Moraš postaviti env var RAPIDAPI_KEY');
+  console.error('❌ RAPIDAPI_KEY nije postavljen');
   process.exit(1);
 }
+if (!fs.existsSync(CACHE_DIR)) {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
-// helper: dobij mux URL (kopirano 1:1 od tebe)
+// Health checks
+app.get('/',    (_req, res) => res.send('OK'));
+app.get('/ready',(_req, res) => res.send('OK'));
+
 function callMux(videoId) {
   const pathMux = `/mux?id=${encodeURIComponent(videoId)}&quality=1080&codec=h264&audioFormat=best`;
   return new Promise((resolve, reject) => {
-    const req = https.request({ method:'GET', hostname:HOST, path:pathMux, headers:{
+    const req = https.request({
+      method: 'GET',
+      hostname: HOST,
+      path: pathMux,
+      headers: {
         'x-rapidapi-key': KEY,
         'x-rapidapi-host': HOST
       }
     }, apiRes => {
-      let body = '';
+      let b = '';
       apiRes.setEncoding('utf8');
-      apiRes.on('data', c => body += c);
-      apiRes.on('end', () => {
-        try { resolve(JSON.parse(body).url); }
-        catch (e) { reject(new Error('Nevalidan JSON iz mux API-ja')); }
+      apiRes.on('data', c => b += c);
+      apiRes.on('end', ()=> {
+        try { resolve(JSON.parse(b)); }
+        catch(_){ reject(new Error('Nevalidan JSON iz mux API-ja')); }
       });
     });
     req.on('error', reject);
@@ -37,61 +47,78 @@ function callMux(videoId) {
   });
 }
 
-// čekaj dok ne dobijemo URL
 async function waitForMux(videoId) {
-  for (let i = 0; i < 15; i++) {
-    try {
-      const url = await callMux(videoId);
-      if (url) return url;
-    } catch(_) {}
-    await new Promise(r => setTimeout(r, 1000));
+  for (let i=0; i<15; i++) {
+    const j = await callMux(videoId).catch(()=>null);
+    if (j?.status==='tunnel' && j.url) return j.url;
+    await new Promise(r=>setTimeout(r,1000));
   }
-  throw new Error('Timeout: mux URL se nije generisao na vreme');
+  throw new Error('Timeout: mux URL nije gotov');
+}
+
+// Download + resume
+function downloadWithResume(videoId, muxUrl, cachePath) {
+  return new Promise((resolve, reject) => {
+    const start = fs.existsSync(cachePath) ? fs.statSync(cachePath).size : 0;
+    const opts = new URL(muxUrl);
+    opts.headers = { Range: `bytes=${start}-` };
+    https.get(opts, mediaRes => {
+      if (mediaRes.statusCode >= 400) return reject(new Error(`HTTP ${mediaRes.statusCode}`));
+      const ws = fs.createWriteStream(cachePath, { flags: start? 'a':'w' });
+      mediaRes.pipe(ws);
+      ws.on('finish', () => resolve());
+      ws.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+// Tail‑reader: streamuje rastući fajl
+function tailStream(cachePath, res) {
+  let pos = 0;
+  const stream = () => {
+    const rs = fs.createReadStream(cachePath, { start: pos });
+    rs.on('data', chunk => {
+      pos += chunk.length;
+      res.write(chunk);
+    });
+    rs.on('end', ()=> {
+      // kad dosegnemo kraj, pričekaj na novi podatak
+      fs.watchFile(cachePath, { interval: 500 }, (curr, prev) => {
+        if (curr.size > prev.size) {
+          fs.unwatchFile(cachePath);
+          stream();
+        }
+      });
+    });
+    rs.on('error', err => res.destroy(err));
+  };
+  stream();
 }
 
 app.get('/stream/:videoId', async (req, res) => {
-  const vid = req.params.videoId;
-  console.log(`➡️ /stream/${vid} — priprema fMP4 toka…`);
+  const vid  = req.params.videoId;
+  const file = path.join(CACHE_DIR, `${vid}.mp4`);
 
-  let muxUrl;
   try {
-    muxUrl = await waitForMux(vid);
-    console.log('✅ dobili mux URL:', muxUrl);
+    // 1) dobij mux URL
+    console.log(`➡️ waitForMux(${vid})`);
+    const muxUrl = await waitForMux(vid);
+    console.log(`✅ mux URL: ${muxUrl}`);
+
+    // 2) startuj download+resume u pozadini
+    console.log(`⬇️ downloadWithResume start`);
+    downloadWithResume(vid, muxUrl, file)
+      .then(()=> console.log(`💾 download complete: ${file}`))
+      .catch(e=> console.error(`❌ download error:`, e));
+
+    // 3) odmah digni response
+    res.setHeader('Content-Type','video/mp4');
+    tailStream(file, res);
+
   } catch (err) {
-    console.error('❌ mux error:', err.message);
-    return res.status(502).send(err.message);
+    console.error(err);
+    res.status(500).send(err.message);
   }
-
-  // podesi header-e za MP4 fMP4 streaming
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Transfer-Encoding', 'chunked');
-
-  // spawn ffmpeg da iz muxUrl pravi fragmentirani MP4
-  const ff = spawn('ffmpeg', [
-    '-hide_banner', '-loglevel', 'error',
-    '-i', muxUrl,
-    '-c', 'copy',
-    '-f', 'mp4',
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-    'pipe:1'
-  ]);
-
-  ff.stdout.pipe(res);
-  ff.stderr.on('data', d => {
-    // možeš pôstaviti debug log ovde, ali filterišući samo važne poruke
-  });
-
-  ff.on('close', code => {
-    console.log(`🔴 ffmpeg exited (${code}) for ${vid}`);
-    res.end();
-  });
-
-  // kada klijent prekine konekciju, ubijemo ffmpeg
-  req.on('close', () => {
-    ff.kill('SIGKILL');
-  });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server sluša na http://0.0.0.0:${PORT}`);
-});
+app.listen(PORT, ()=>console.log(`🚀 na http://0.0.0.0:${PORT}`));
