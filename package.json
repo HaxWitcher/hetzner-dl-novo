@@ -1,11 +1,12 @@
 {
-  "name": "youtube-fmp4-proxy",
+  "name": "youtube-tail-streamer",
   "version": "1.0.0",
+  "description": "Tail‐reader streamer za YouTube mux URL",
   "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "express": "^4.18.2"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }
