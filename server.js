@@ -1,33 +1,31 @@
 const express = require('express');
-const https   = require('https');
-const fs      = require('fs');
-const path    = require('path');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
 
-const app       = express();
-const PORT      = process.env.PORT || 7860;
-const KEY       = process.env.RAPIDAPI_KEY;
-const HOST      = 'cloud-api-hub-youtube-downloader.p.rapidapi.com';
+const app  = express();
+const PORT = process.env.PORT || 7860;
+const KEY  = process.env.RAPIDAPI_KEY;
+const HOST = 'cloud-api-hub-youtube-downloader.p.rapidapi.com';
 
-const CACHE_DIR = '/tmp/cache';
+const CACHE_ROOT = '/tmp/cache';
 if (!KEY) {
   console.error('❌ Moraš postaviti env var RAPIDAPI_KEY');
   process.exit(1);
 }
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  console.log('📂 Kreiran cache dir:', CACHE_DIR);
+if (!fs.existsSync(CACHE_ROOT)) {
+  fs.mkdirSync(CACHE_ROOT, { recursive: true });
 }
 
-// === 1) provjereni callMux + waitForMux ===
-
+// --- Mux helper (1:1 tvoj kod) ---
 function callMux(videoId) {
-  const p = `/mux?id=${encodeURIComponent(videoId)}&quality=1080&codec=h264&audioFormat=best`;
-  return new Promise((res, rej) => {
-    const r = https.request({
+  const pathMux = `/mux?id=${encodeURIComponent(videoId)}&quality=1080&codec=h264&audioFormat=best`;
+  return new Promise((resolve, reject) => {
+    const req = https.request({
       method:  'GET',
       hostname: HOST,
-      path:    p,
+      path:    pathMux,
       headers: {
         'x-rapidapi-key':  KEY,
         'x-rapidapi-host': HOST
@@ -37,109 +35,78 @@ function callMux(videoId) {
       apiRes.setEncoding('utf8');
       apiRes.on('data', c => body += c);
       apiRes.on('end', () => {
-        try { res(JSON.parse(body)); }
-        catch (e) { rej(new Error('Nevalidan JSON iz mux API-ja')); }
+        try { resolve(JSON.parse(body)); }
+        catch (e) { reject(new Error('Nevalidan JSON iz mux API-ja')); }
       });
     });
-    r.on('error', rej);
-    r.end();
+    req.on('error', reject);
+    req.end();
   });
 }
 
-async function waitForMux(videoId, retries = 15, delay = 1000) {
-  for (let i = 0; i < retries; i++) {
-    const j = await callMux(videoId);
-    if (j.status==='tunnel' && j.url) return j.url;
-    console.log(`⏳ mux status=${j.status}, retry ${i+1}/${retries}`);
-    await new Promise(r => setTimeout(r, delay));
+async function waitForMux(videoId, maxRetries = 15, delayMs = 1000) {
+  for (let i = 0; i < maxRetries; i++) {
+    const json = await callMux(videoId);
+    if (json.status === 'tunnel' && json.url) {
+      return json.url;
+    }
+    console.log(`⏳ mux još nije gotov (status=${json.status}), retry ${i+1}`);
+    await new Promise(r => setTimeout(r, delayMs));
   }
   throw new Error('Timeout: mux URL se nije generisao na vreme');
 }
 
-// === 2) download cijelog MP4 u cache/VIDEO.mp4 ===
+// --- Spawn FFmpeg to HLS ---
+function ensureHls(videoId, muxUrl) {
+  const dir = path.join(CACHE_ROOT, videoId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-function downloadVideo(url, dest) {
-  return new Promise((res, rej) => {
-    const ws = fs.createWriteStream(dest);
-    https.get(url, r => {
-      r.pipe(ws);
-      r.on('end', () => { ws.close(); res(); });
-      r.on('error', rej);
-    }).on('error', rej);
+  // ako FFmpeg već radi, vratimo
+  if (processes.has(videoId)) return processes.get(videoId);
+
+  // Output: playlist and 4s segments
+  const args = [
+    '-i', muxUrl,
+    '-c', 'copy',
+    '-f', 'hls',
+    '-hls_time', '4',
+    '-hls_list_size', '0',
+    '-hls_flags', 'delete_segments',
+    path.join(dir, 'index.m3u8')
+  ];
+  const ff = spawn('ffmpeg', args, { stdio: 'ignore' });
+  ff.on('exit', (code) => {
+    console.log(`FFmpeg za ${videoId} završio s ${code}`);
+    processes.delete(videoId);
   });
+  processes.set(videoId, ff);
+  return ff;
 }
 
-// === 3) generisanje HLS ===
+const processes = new Map();
 
-function ensureHLS(videoId) {
-  const mp4 = path.join(CACHE_DIR, `${videoId}.mp4`);
-  const hlsDir = path.join(CACHE_DIR, videoId + '_hls');
-  const playlist = path.join(hlsDir, 'master.m3u8');
-
-  // ako već postoji playlist, vraćamo ga
-  if (fs.existsSync(playlist)) return Promise.resolve();
-
-  // inače generišemo
-  fs.mkdirSync(hlsDir, { recursive: true });
-
-  return new Promise((res, rej) => {
-    const ff = spawn('ffmpeg', [
-      '-i', mp4,
-      '-c', 'copy',
-      '-hls_time', '6',
-      '-hls_list_size', '0',
-      '-hls_flags', 'independent_segments',
-      '-hls_segment_filename', path.join(hlsDir, 'seg%03d.ts'),
-      playlist
-    ]);
-    ff.on('exit', code => {
-      if (code === 0) {
-        console.log('✅ HLS generisano za', videoId);
-        res();
-      } else {
-        rej(new Error(`ffmpeg exited ${code}`));
-      }
-    });
-  });
-}
-
-// === static serve segmenata ===
-
-app.use('/hls/:videoId', express.static(path.join(CACHE_DIR)));
-
-
-// === glavni endpoint ===
-
-app.get('/stream/:videoId', async (req, res) => {
+// --- Serve HLS dirs statically ---
+app.use('/hls/:videoId', async (req, res, next) => {
   const vid = req.params.videoId;
-  const mp4 = path.join(CACHE_DIR, `${vid}.mp4`);
-
   try {
-    // 1) čekaj mux url
-    console.log(`➡️ /stream/${vid} — priprema...`);
+    // 1) dobij muxUrl
     const muxUrl = await waitForMux(vid);
+    console.log(`✅ mux URL za ${vid}: ${muxUrl}`);
+    // 2) start FFmpeg HLS
+    ensureHls(vid, muxUrl);
+    // 3) serve static files
+    express.static(path.join(CACHE_ROOT, vid))(req, res, next);
 
-    // 2) download ako ne postoji
-    if (!fs.existsSync(mp4)) {
-      console.log(`⬇️ preuzimam MP4 za ${vid}...`);
-      await downloadVideo(muxUrl, mp4);
-      console.log(`💾 MP4 spreman: ${mp4}`);
-    }
-
-    // 3) generiši HLS
-    await ensureHLS(vid);
-
-    // 4) redirekcija na playlistu
-    const url = `/hls/${vid}/${vid}_hls/master.m3u8`;
-    console.log(`▶️ Stream startuje preko HLS: ${url}`);
-    res.redirect(url);
-
-  } catch (e) {
-    console.error('❌ stream failed:', e);
-    res.status(500).send(e.message);
+  } catch (err) {
+    console.error('❌ HLS error:', err);
+    res.status(502).send(err.message);
   }
 });
 
+// health
+app.get('/', (_req, res) => res.send('OK'));
+app.get('/ready', (_req, res) => res.send('OK'));
+
 app.listen(PORT, () => {
-  console.log(`🚀 sluša na http://0.0.0.0:${PORT}`);  
+  console.log(`🚀 HLS proxy na http://0.0.0.0:${PORT}/hls/:videoId/index.m3u8`);
 });
