@@ -1,33 +1,26 @@
+// server.js
 const express = require('express');
+const https   = require('https');
 const { spawn } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const https = require('https');
+const fs      = require('fs');
+const path    = require('path');
 
-const app  = express();
-const PORT = process.env.PORT || 7860;
-const KEY  = process.env.RAPIDAPI_KEY;
-const HOST = 'cloud-api-hub-youtube-downloader.p.rapidapi.com';
+const app       = express();
+const PORT      = process.env.PORT || 7860;
+const KEY       = process.env.RAPIDAPI_KEY;
+const HOST      = 'cloud-api-hub-youtube-downloader.p.rapidapi.com';
 
-const CACHE_ROOT = '/tmp/cache';
 if (!KEY) {
   console.error('❌ Moraš postaviti env var RAPIDAPI_KEY');
   process.exit(1);
 }
-if (!fs.existsSync(CACHE_ROOT)) {
-  fs.mkdirSync(CACHE_ROOT, { recursive: true });
-}
 
-// --- Mux helper (1:1 tvoj kod) ---
+// helper: dobij mux URL (kopirano 1:1 od tebe)
 function callMux(videoId) {
   const pathMux = `/mux?id=${encodeURIComponent(videoId)}&quality=1080&codec=h264&audioFormat=best`;
   return new Promise((resolve, reject) => {
-    const req = https.request({
-      method:  'GET',
-      hostname: HOST,
-      path:    pathMux,
-      headers: {
-        'x-rapidapi-key':  KEY,
+    const req = https.request({ method:'GET', hostname:HOST, path:pathMux, headers:{
+        'x-rapidapi-key': KEY,
         'x-rapidapi-host': HOST
       }
     }, apiRes => {
@@ -35,7 +28,7 @@ function callMux(videoId) {
       apiRes.setEncoding('utf8');
       apiRes.on('data', c => body += c);
       apiRes.on('end', () => {
-        try { resolve(JSON.parse(body)); }
+        try { resolve(JSON.parse(body).url); }
         catch (e) { reject(new Error('Nevalidan JSON iz mux API-ja')); }
       });
     });
@@ -44,69 +37,61 @@ function callMux(videoId) {
   });
 }
 
-async function waitForMux(videoId, maxRetries = 15, delayMs = 1000) {
-  for (let i = 0; i < maxRetries; i++) {
-    const json = await callMux(videoId);
-    if (json.status === 'tunnel' && json.url) {
-      return json.url;
-    }
-    console.log(`⏳ mux još nije gotov (status=${json.status}), retry ${i+1}`);
-    await new Promise(r => setTimeout(r, delayMs));
+// čekaj dok ne dobijemo URL
+async function waitForMux(videoId) {
+  for (let i = 0; i < 15; i++) {
+    try {
+      const url = await callMux(videoId);
+      if (url) return url;
+    } catch(_) {}
+    await new Promise(r => setTimeout(r, 1000));
   }
   throw new Error('Timeout: mux URL se nije generisao na vreme');
 }
 
-// --- Spawn FFmpeg to HLS ---
-function ensureHls(videoId, muxUrl) {
-  const dir = path.join(CACHE_ROOT, videoId);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+app.get('/stream/:videoId', async (req, res) => {
+  const vid = req.params.videoId;
+  console.log(`➡️ /stream/${vid} — priprema fMP4 toka…`);
 
-  // ako FFmpeg već radi, vratimo
-  if (processes.has(videoId)) return processes.get(videoId);
+  let muxUrl;
+  try {
+    muxUrl = await waitForMux(vid);
+    console.log('✅ dobili mux URL:', muxUrl);
+  } catch (err) {
+    console.error('❌ mux error:', err.message);
+    return res.status(502).send(err.message);
+  }
 
-  // Output: playlist and 4s segments
-  const args = [
+  // podesi header-e za MP4 fMP4 streaming
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Transfer-Encoding', 'chunked');
+
+  // spawn ffmpeg da iz muxUrl pravi fragmentirani MP4
+  const ff = spawn('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error',
     '-i', muxUrl,
     '-c', 'copy',
-    '-f', 'hls',
-    '-hls_time', '4',
-    '-hls_list_size', '0',
-    '-hls_flags', 'delete_segments',
-    path.join(dir, 'index.m3u8')
-  ];
-  const ff = spawn('ffmpeg', args, { stdio: 'ignore' });
-  ff.on('exit', (code) => {
-    console.log(`FFmpeg za ${videoId} završio s ${code}`);
-    processes.delete(videoId);
+    '-f', 'mp4',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    'pipe:1'
+  ]);
+
+  ff.stdout.pipe(res);
+  ff.stderr.on('data', d => {
+    // možeš pôstaviti debug log ovde, ali filterišući samo važne poruke
   });
-  processes.set(videoId, ff);
-  return ff;
-}
 
-const processes = new Map();
+  ff.on('close', code => {
+    console.log(`🔴 ffmpeg exited (${code}) for ${vid}`);
+    res.end();
+  });
 
-// --- Serve HLS dirs statically ---
-app.use('/hls/:videoId', async (req, res, next) => {
-  const vid = req.params.videoId;
-  try {
-    // 1) dobij muxUrl
-    const muxUrl = await waitForMux(vid);
-    console.log(`✅ mux URL za ${vid}: ${muxUrl}`);
-    // 2) start FFmpeg HLS
-    ensureHls(vid, muxUrl);
-    // 3) serve static files
-    express.static(path.join(CACHE_ROOT, vid))(req, res, next);
-
-  } catch (err) {
-    console.error('❌ HLS error:', err);
-    res.status(502).send(err.message);
-  }
+  // kada klijent prekine konekciju, ubijemo ffmpeg
+  req.on('close', () => {
+    ff.kill('SIGKILL');
+  });
 });
 
-// health
-app.get('/', (_req, res) => res.send('OK'));
-app.get('/ready', (_req, res) => res.send('OK'));
-
 app.listen(PORT, () => {
-  console.log(`🚀 HLS proxy na http://0.0.0.0:${PORT}/hls/:videoId/index.m3u8`);
+  console.log(`🚀 Server sluša na http://0.0.0.0:${PORT}`);
 });
