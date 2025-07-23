@@ -8,117 +8,117 @@ const PORT      = process.env.PORT || 7860;
 const KEY       = process.env.RAPIDAPI_KEY;
 const HOST      = 'cloud-api-hub-youtube-downloader.p.rapidapi.com';
 const CACHE_DIR = '/tmp/cache';
-const TTL_MS    = 3 * 60 * 60 * 1000; // 3h
+const MIN_CHUNK = 100 * 1024;    // 100KB
 
 if (!KEY) {
   console.error('❌ RAPIDAPI_KEY nije postavljen');
   process.exit(1);
 }
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// Health checks
-app.get('/',    (_req, res) => res.send('OK'));
-app.get('/ready',(_req, res) => res.send('OK'));
+// mapa: videoId → { promise: Promise, muxUrl: string }
+const jobs = new Map();
+
+// Health
+app.get('/', (_q,r)=>r.send('OK'));
+app.get('/ready', (_q,r)=>r.send('OK'));
 
 function callMux(videoId) {
   const pathMux = `/mux?id=${encodeURIComponent(videoId)}&quality=1080&codec=h264&audioFormat=best`;
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      method: 'GET',
-      hostname: HOST,
-      path: pathMux,
-      headers: {
-        'x-rapidapi-key': KEY,
-        'x-rapidapi-host': HOST
-      }
-    }, apiRes => {
-      let b = '';
-      apiRes.setEncoding('utf8');
-      apiRes.on('data', c => b += c);
-      apiRes.on('end', ()=> {
-        try { resolve(JSON.parse(b)); }
-        catch(_){ reject(new Error('Nevalidan JSON iz mux API-ja')); }
+  return new Promise((res,rej)=>{
+    const req = https.request({method:'GET',hostname:HOST,path:pathMux,headers:{
+      'x-rapidapi-key':KEY,'x-rapidapi-host':HOST
+    }}, r=>{
+      let b='';
+      r.setEncoding('utf8');
+      r.on('data',c=>b+=c);
+      r.on('end',()=>{
+        try { res(JSON.parse(b)); }
+        catch { rej(new Error('Invalid JSON')); }
       });
     });
-    req.on('error', reject);
+    req.on('error', rej);
     req.end();
   });
 }
 
 async function waitForMux(videoId) {
-  for (let i=0; i<15; i++) {
+  for (let i=0;i<15;i++){
     const j = await callMux(videoId).catch(()=>null);
-    if (j?.status==='tunnel' && j.url) return j.url;
+    if (j?.status==='tunnel'&&j.url) return j.url;
     await new Promise(r=>setTimeout(r,1000));
   }
-  throw new Error('Timeout: mux URL nije gotov');
+  throw new Error('mux timeout');
 }
 
-// Download + resume
-function downloadWithResume(videoId, muxUrl, cachePath) {
-  return new Promise((resolve, reject) => {
-    const start = fs.existsSync(cachePath) ? fs.statSync(cachePath).size : 0;
+function downloadResume(muxUrl, file){
+  return new Promise((res,rej)=>{
+    const start = fs.existsSync(file)? fs.statSync(file).size : 0;
     const opts = new URL(muxUrl);
     opts.headers = { Range: `bytes=${start}-` };
-    https.get(opts, mediaRes => {
-      if (mediaRes.statusCode >= 400) return reject(new Error(`HTTP ${mediaRes.statusCode}`));
-      const ws = fs.createWriteStream(cachePath, { flags: start? 'a':'w' });
-      mediaRes.pipe(ws);
-      ws.on('finish', () => resolve());
-      ws.on('error', reject);
-    }).on('error', reject);
+    https.get(opts, r=>{
+      if (r.statusCode>=400) return rej(new Error('HTTP '+r.statusCode));
+      const ws = fs.createWriteStream(file,{flags:start?'a':'w'});
+      r.pipe(ws);
+      ws.on('finish', ()=>res());
+      ws.on('error', rej);
+    }).on('error', rej);
   });
 }
 
-// Tail‑reader: streamuje rastući fajl
-function tailStream(cachePath, res) {
+function tailStream(file, res){
   let pos = 0;
-  const stream = () => {
-    const rs = fs.createReadStream(cachePath, { start: pos });
-    rs.on('data', chunk => {
+  const serve = ()=>{
+    const rs = fs.createReadStream(file,{start:pos});
+    rs.on('data',chunk=>{
       pos += chunk.length;
       res.write(chunk);
     });
-    rs.on('end', ()=> {
-      // kad dosegnemo kraj, pričekaj na novi podatak
-      fs.watchFile(cachePath, { interval: 500 }, (curr, prev) => {
-        if (curr.size > prev.size) {
-          fs.unwatchFile(cachePath);
-          stream();
+    rs.on('end',()=>{
+      // čekaj nove bajtove
+      const watcher = setInterval(()=>{
+        const sz = fs.statSync(file).size;
+        if (sz > pos){
+          clearInterval(watcher);
+          serve();
         }
-      });
+      },250);
     });
-    rs.on('error', err => res.destroy(err));
+    rs.on('error',e=>res.destroy(e));
   };
-  stream();
+  serve();
 }
+
+app.head('/stream/:videoId', (_q,r)=>r.sendStatus(200));
 
 app.get('/stream/:videoId', async (req, res) => {
   const vid  = req.params.videoId;
-  const file = path.join(CACHE_DIR, `${vid}.mp4`);
+  const file = path.join(CACHE_DIR, vid+'.mp4');
 
-  try {
-    // 1) dobij mux URL
-    console.log(`➡️ waitForMux(${vid})`);
-    const muxUrl = await waitForMux(vid);
-    console.log(`✅ mux URL: ${muxUrl}`);
-
-    // 2) startuj download+resume u pozadini
-    console.log(`⬇️ downloadWithResume start`);
-    downloadWithResume(vid, muxUrl, file)
-      .then(()=> console.log(`💾 download complete: ${file}`))
-      .catch(e=> console.error(`❌ download error:`, e));
-
-    // 3) odmah digni response
-    res.setHeader('Content-Type','video/mp4');
-    tailStream(file, res);
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).send(err.message);
+  // inicijaliziraj job jednom
+  if (!jobs.has(vid)) {
+    const job = (async ()=>{
+      const muxUrl = await waitForMux(vid);
+      console.log(`✅ mux ${vid}: ${muxUrl}`);
+      // download u pozadini (resume)
+      await downloadResume(muxUrl, file);
+      console.log(`💾 complete ${vid}`);
+    })();
+    jobs.set(vid, job);
+    // po dovršetku može se cleanup iz map
+    job.then(()=>jobs.delete(vid), ()=>jobs.delete(vid));
   }
+
+  // čekaj barem MIN_CHUNK bajtova
+  let t0 = Date.now();
+  while (true) {
+    if (fs.existsSync(file) && fs.statSync(file).size >= MIN_CHUNK) break;
+    if (Date.now() - t0 > 10_000) break; // max 10s čekanja
+    await new Promise(r=>setTimeout(r,200));
+  }
+
+  res.setHeader('Content-Type','video/mp4');
+  tailStream(file, res);
 });
 
 app.listen(PORT, ()=>console.log(`🚀 na http://0.0.0.0:${PORT}`));
