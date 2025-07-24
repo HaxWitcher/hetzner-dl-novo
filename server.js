@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const https   = require('https');
 const fs      = require('fs');
@@ -16,7 +17,7 @@ if (!KEY) {
 }
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// Za svaki vid čuvamo { promise, completed }
+// Za svaki video čuvamo { promise, completed }
 const jobs = new Map();
 
 app.get('/', (_q, r) => r.send('OK'));
@@ -76,9 +77,8 @@ function tailStream(file, res, isCompleted) {
     });
     rs.on('end', () => {
       if (isCompleted()) {
-        return res.end();         // download gotov, zatvori stream
+        return res.end();
       }
-      // inače čekaj nove podatke
       const watcher = setInterval(() => {
         const sz = fs.statSync(file).size;
         if (sz > pos) {
@@ -98,7 +98,7 @@ app.get('/stream/:videoId', async (req, res) => {
   const vid  = req.params.videoId;
   const file = path.join(CACHE_DIR, vid + '.mp4');
 
-  // pokreni download jednokratno
+  // 1) Jednom pokrenemo pozadinski download
   if (!jobs.has(vid)) {
     const entry = { completed: false };
     entry.promise = (async () => {
@@ -108,13 +108,18 @@ app.get('/stream/:videoId', async (req, res) => {
       entry.completed = true;
       console.log(`💾 complete ${vid}`);
     })();
-    // cleanup
     entry.promise.then(() => jobs.delete(vid), () => jobs.delete(vid));
     jobs.set(vid, entry);
   }
 
-  // sačekaj da se nakupi barem MIN_CHUNK
+  // 2) Ako je fajl kompletno skinut, **redirect** na Nginx statički URL
   const entry = jobs.get(vid);
+  if (entry.completed && fs.existsSync(file)) {
+    // Nginx /videos/ alias → /tmp/cache/
+    return res.redirect(302, `/videos/${vid}.mp4`);
+  }
+
+  // 3) Sačekamo da se nakupi bar MIN_CHUNK
   let t0 = Date.now();
   while (true) {
     if (fs.existsSync(file) && fs.statSync(file).size >= MIN_CHUNK) break;
@@ -122,8 +127,9 @@ app.get('/stream/:videoId', async (req, res) => {
     await new Promise(r => setTimeout(r, 200));
   }
 
+  // 4) Streamamo rastući fajl direktno preko Node‑a
   res.setHeader('Content-Type', 'video/mp4');
   tailStream(file, res, () => jobs.get(vid)?.completed);
 });
 
-app.listen(PORT, () => console.log(`🚀 na http://0.0.0.0:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server sluša na http://0.0.0.0:${PORT}`));
