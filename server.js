@@ -8,7 +8,8 @@ const PORT      = process.env.PORT || 7860;
 const KEY       = process.env.RAPIDAPI_KEY;
 const HOST      = 'cloud-api-hub-youtube-downloader.p.rapidapi.com';
 const CACHE_DIR = '/tmp/cache';
-const MIN_CHUNK = 100 * 1024;    // 100KB
+// umjesto 100 KB sad čeka 50 MB
+const MIN_CHUNK = 50 * 1024 * 1024;    // 50MB
 
 if (!KEY) {
   console.error('❌ RAPIDAPI_KEY nije postavljen');
@@ -16,7 +17,7 @@ if (!KEY) {
 }
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// mapa: videoId → { promise: Promise, muxUrl: string }
+// mapa: videoId → Promise download‑a
 const jobs = new Map();
 
 // Health
@@ -75,7 +76,6 @@ function tailStream(file, res){
       res.write(chunk);
     });
     rs.on('end',()=>{
-      // čekaj nove bajtove
       const watcher = setInterval(()=>{
         const sz = fs.statSync(file).size;
         if (sz > pos){
@@ -95,25 +95,22 @@ app.get('/stream/:videoId', async (req, res) => {
   const vid  = req.params.videoId;
   const file = path.join(CACHE_DIR, vid+'.mp4');
 
-  // inicijaliziraj job jednom
   if (!jobs.has(vid)) {
     const job = (async ()=>{
       const muxUrl = await waitForMux(vid);
       console.log(`✅ mux ${vid}: ${muxUrl}`);
-      // download u pozadini (resume)
       await downloadResume(muxUrl, file);
       console.log(`💾 complete ${vid}`);
     })();
     jobs.set(vid, job);
-    // po dovršetku može se cleanup iz map
     job.then(()=>jobs.delete(vid), ()=>jobs.delete(vid));
   }
 
-  // čekaj barem MIN_CHUNK bajtova
+  // čekanje na početni buffer
   let t0 = Date.now();
   while (true) {
     if (fs.existsSync(file) && fs.statSync(file).size >= MIN_CHUNK) break;
-    if (Date.now() - t0 > 10_000) break; // max 10s čekanja
+    if (Date.now() - t0 > 20_000) break; // maksimalno 20s čekanja
     await new Promise(r=>setTimeout(r,200));
   }
 
